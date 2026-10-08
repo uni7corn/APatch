@@ -2,19 +2,25 @@ package me.bmax.apatch
 
 import android.app.Application
 import android.content.Context
+import android.content.Intent
 import android.content.SharedPreferences
 import android.os.Build
 import android.util.Log
 import android.widget.Toast
+import androidx.core.content.edit
 import androidx.lifecycle.LiveData
 import androidx.lifecycle.MutableLiveData
 import com.topjohnwu.superuser.CallbackList
+import me.bmax.apatch.ui.CrashHandleActivity
 import me.bmax.apatch.util.APatchCli
 import me.bmax.apatch.util.APatchKeyHelper
 import me.bmax.apatch.util.Version
 import me.bmax.apatch.util.getRootShell
 import me.bmax.apatch.util.rootShellForResult
+import okhttp3.Cache
+import okhttp3.OkHttpClient
 import java.io.File
+import java.util.Locale
 import kotlin.concurrent.thread
 import kotlin.system.exitProcess
 
@@ -22,7 +28,13 @@ lateinit var apApp: APApplication
 
 const val TAG = "APatch"
 
-class APApplication : Application() {
+class APApplication : Application(), Thread.UncaughtExceptionHandler {
+    lateinit var okhttpClient: OkHttpClient
+
+    init {
+        Thread.setDefaultUncaughtExceptionHandler(this)
+    }
+
     enum class State {
         UNKNOWN_STATE,
 
@@ -42,18 +54,25 @@ class APApplication : Application() {
         private const val APATCH_BIN_FOLDER = APATCH_FOLDER + "bin/"
         private const val APATCH_LOG_FOLDER = APATCH_FOLDER + "log/"
         private const val APD_LINK_PATH = APATCH_BIN_FOLDER + "apd"
-        private const val KPATCH_LINK_PATH = APATCH_BIN_FOLDER + "kpatch"
         const val PACKAGE_CONFIG_FILE = APATCH_FOLDER + "package_config"
         const val SU_PATH_FILE = APATCH_FOLDER + "su_path"
         const val SAFEMODE_FILE = "/dev/.safemode"
         private const val NEED_REBOOT_FILE = "/dev/.need_reboot"
         const val GLOBAL_NAMESPACE_FILE = "/data/adb/.global_namespace_enable"
+        const val SUCOMPAT_FILE = "/data/adb/ap/sucompat"
+        const val SELINUX_HIDE_FILE = APATCH_FOLDER + "selinux_hide"
+        const val JAILBREAK_FILE = APATCH_FOLDER + "jailbreak"
+        const val JAILBREAK_KO_PATH = APATCH_FOLDER + "kernelpatch.ko"
+        /** Persisted, file-backed KPMs. Each module lives in <id>/<id>.kpm. */
+        const val KPMS_DIR = APATCH_FOLDER + "kpm/"
 
         @Deprecated("Use 'apd -V'")
         const val APATCH_VERSION_PATH = APATCH_FOLDER + "version"
         private const val MAGISKPOLICY_BIN_PATH = APATCH_BIN_FOLDER + "magiskpolicy"
         private const val BUSYBOX_BIN_PATH = APATCH_BIN_FOLDER + "busybox"
         private const val RESETPROP_BIN_PATH = APATCH_BIN_FOLDER + "resetprop"
+        private const val KPTOOLS_BIN_PATH = APATCH_BIN_FOLDER + "kptools"
+        const val DEFAULT_SCONTEXT = "u:r:untrusted_app:s0"
         const val MAGISK_SCONTEXT = "u:r:magisk:s0"
 
         private const val DEFAULT_SU_PATH = "/system/bin/kp"
@@ -121,12 +140,17 @@ class APApplication : Application() {
                 "ln -s $APD_PATH $APD_LINK_PATH",
                 "restorecon $APD_PATH",
 
-                "cp -f ${nativeDir}/libmagiskpolicy.so $MAGISKPOLICY_BIN_PATH",
-                "chmod +x $MAGISKPOLICY_BIN_PATH",
-                "cp -f ${nativeDir}/libresetprop.so $RESETPROP_BIN_PATH",
-                "chmod +x $RESETPROP_BIN_PATH",
+                "rm -f $MAGISKPOLICY_BIN_PATH",
+                "ln -s $APD_PATH $MAGISKPOLICY_BIN_PATH",
+                "rm -f $RESETPROP_BIN_PATH",
+                "ln -s $APD_PATH $RESETPROP_BIN_PATH",
+               
                 "cp -f ${nativeDir}/libbusybox.so $BUSYBOX_BIN_PATH",
                 "chmod +x $BUSYBOX_BIN_PATH",
+                "cp -f ${nativeDir}/libkptools.so $KPTOOLS_BIN_PATH",
+                "chmod +x $KPTOOLS_BIN_PATH",
+
+
 
                 "touch $PACKAGE_CONFIG_FILE",
                 "touch $SU_PATH_FILE",
@@ -165,8 +189,6 @@ class APApplication : Application() {
                 Log.d(TAG, "state: " + _kpStateLiveData.value)
                 if (!ready) return
 
-                APatchKeyHelper.writeSPSuperKey(value)
-
                 thread {
                     val rc = Natives.su(0, null)
                     if (!rc) {
@@ -175,8 +197,12 @@ class APApplication : Application() {
                     }
 
                     // KernelPatch version
-                    val buildV = Version.buildKPVUInt()
-                    val installedV = Version.installedKPVUInt()
+                    //val buildV = Version.buildKPVUInt()
+                    //val installedV = Version.installedKPVUInt()
+                    //use build time to check update
+                    val buildV = Version.getKpImg()
+                    val installedV = Version.installedKPTime()
+
 
                     Log.d(TAG, "kp installed version: ${installedV}, build version: $buildV")
 
@@ -200,7 +226,7 @@ class APApplication : Application() {
                         _apStateLiveData.postValue(State.ANDROIDPATCH_INSTALLED)
                     }
 
-                    if (Version.installedApdVInt > 0 && mgv != Version.installedApdVInt) {
+                    if (Version.installedApdVInt > 0 && mgv.toInt() != Version.installedApdVInt) {
                         _apStateLiveData.postValue(State.ANDROIDPATCH_NEED_UPDATE)
                         // su path
                         val suPathFile = File(SU_PATH_FILE)
@@ -217,10 +243,52 @@ class APApplication : Application() {
                     return@thread
                 }
             }
+
+        /**
+         * Resolve the SuperKey used to authenticate against the running kernel.
+         *
+         * The new manager defaults to "su" (implicit signature/uid authorization).
+         * Kernels patched by legacy versions, however, were patched with a real
+         * random/custom SuperKey and know nothing about signature authorization,
+         * so "su" fails for users who upgraded from such a version. To keep the
+         * original SuperKey upgrade path working, fall back to the legacy SuperKey
+         * persisted (Keystore-encrypted) by older managers and use it to elevate,
+         * letting the user upgrade the kernel to the latest signature-authorized one.
+         *
+         * Once "su" succeeds the kernel no longer relies on a SuperKey, so any
+         * stale legacy key is cleared.
+         */
+        private fun resolveSuperKey(): String {
+            APatchKeyHelper.setSharedPreferences(sharedPreferences)
+            val savedKey = APatchKeyHelper.readSPSuperKey()
+
+            // Signature authorization (new default).
+            if (Natives.nativeReady("su")) {
+                if (!savedKey.isNullOrEmpty()) {
+                    APatchKeyHelper.clearConfigKey()
+                    Log.i(TAG, "signature auth ready, cleared legacy SuperKey")
+                }
+                return "su"
+            }
+
+            // Legacy kernel patched with a real SuperKey: reuse the stored one.
+            if (!savedKey.isNullOrEmpty() && Natives.nativeReady(savedKey)) {
+                Log.i(TAG, "fallback to legacy stored SuperKey for upgrade")
+                return savedKey
+            }
+
+            return "su"
+        }
     }
 
     override fun onCreate() {
         super.onCreate()
+        // The app-zygote for the jailbreak MagicaService runs without a UserManager,
+        // so shared prefs and other context-dependent setup are unavailable there.
+        // AppZygotePreload drives the jailbreak via JNI directly; skip init here.
+        if (getSystemService(Context.USER_SERVICE) == null) {
+            return
+        }
         apApp = this
 
         val isArm64 = Build.SUPPORTED_ABIS.any { it == "arm64-v8a" }
@@ -235,8 +303,17 @@ class APApplication : Application() {
         // TODO: 1. make me root by kernel
         // TODO: 2. remove all usage of superkey
         sharedPreferences = getSharedPreferences(SP_NAME, Context.MODE_PRIVATE)
-        APatchKeyHelper.setSharedPreferences(sharedPreferences)
-        superKey = APatchKeyHelper.readSPSuperKey()
+        superKey = resolveSuperKey()
+
+        okhttpClient =
+            OkHttpClient.Builder().cache(Cache(File(cacheDir, "okhttp"), 10 * 1024 * 1024))
+                .addInterceptor { block ->
+                    block.proceed(
+                        block.request().newBuilder()
+                            .header("User-Agent", "APatch/${BuildConfig.VERSION_CODE}")
+                            .header("Accept-Language", Locale.getDefault().toLanguageTag()).build()
+                    )
+                }.build()
     }
 
     fun getBackupWarningState(): Boolean {
@@ -244,6 +321,19 @@ class APApplication : Application() {
     }
 
     fun updateBackupWarningState(state: Boolean) {
-        sharedPreferences.edit().putBoolean(SHOW_BACKUP_WARN, state).apply()
+        sharedPreferences.edit { putBoolean(SHOW_BACKUP_WARN, state) }
+    }
+
+    override fun uncaughtException(t: Thread, e: Throwable) {
+        val exceptionMessage = Log.getStackTraceString(e)
+        val threadName = t.name
+        Log.e(TAG, "Error on thread $threadName:\n $exceptionMessage")
+        val intent = Intent(this, CrashHandleActivity::class.java).apply {
+            putExtra("exception_message", exceptionMessage)
+            putExtra("thread", threadName)
+            flags = Intent.FLAG_ACTIVITY_NEW_TASK
+        }
+        startActivity(intent)
+        exitProcess(10)
     }
 }

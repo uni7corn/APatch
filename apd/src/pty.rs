@@ -1,38 +1,44 @@
-use std::ffi::c_int;
-use std::fs::File;
-use std::io::{stderr, stdin, stdout, Read, Write};
-use std::mem::MaybeUninit;
-use std::os::fd::{AsFd, AsRawFd, OwnedFd, RawFd};
-use std::process::exit;
-use std::ptr::null_mut;
-use std::thread;
-
-use anyhow::{bail, Ok, Result};
-use libc::{
-    __errno, fork, pthread_sigmask, sigaddset, sigemptyset, sigset_t, sigwait, waitpid, winsize,
-    EINTR, SIGWINCH, SIG_BLOCK, SIG_UNBLOCK, TIOCGWINSZ, TIOCSWINSZ,
+use std::{
+    ffi::c_int,
+    fs::File,
+    io::{Read, Write, stderr, stdin, stdout},
+    mem::MaybeUninit,
+    os::fd::{AsFd, AsRawFd, OwnedFd, RawFd},
+    process::exit,
+    ptr::null_mut,
+    sync::Mutex,
+    thread,
 };
-use rustix::fs::{open, Mode, OFlags};
-use rustix::io::dup;
-use rustix::ioctl::{ioctl, Getter, ReadOpcode};
-use rustix::process::setsid;
-use rustix::pty::{grantpt, unlockpt};
-use rustix::stdio::{dup2_stderr, dup2_stdin, dup2_stdout};
-use rustix::termios::{isatty, tcgetattr, tcsetattr, OptionalActions, Termios};
 
-use crate::defs::PTS_NAME;
-use crate::utils::get_tmp_path;
+use anyhow::{Ok, Result, bail};
+use libc::{
+    __errno, EINTR, SIG_BLOCK, SIG_UNBLOCK, SIGWINCH, TIOCGWINSZ, TIOCSWINSZ, fork,
+    pthread_sigmask, sigaddset, sigemptyset, sigset_t, sigwait, waitpid, winsize,
+};
+use rustix::{
+    fs::{Mode, OFlags, open},
+    io::dup,
+    ioctl::{Getter, Opcode, ioctl, opcode},
+    process::setsid,
+    pty::{grantpt, unlockpt},
+    stdio::{dup2_stderr, dup2_stdin, dup2_stdout},
+    termios::{OptionalActions, Termios, isatty, tcgetattr, tcsetattr},
+};
+
+use crate::{defs::PTS_NAME, utils::get_tmp_path};
 
 // https://github.com/topjohnwu/Magisk/blob/5627053b7481618adfdf8fa3569b48275589915b/native/src/core/su/pts.cpp
 
 fn get_pty_num<F: AsFd>(fd: F) -> Result<u32> {
+    // TIOCGPTN: Get the PTY number
+    const TIOCGPTN: Opcode = opcode::read::<u32>(b'T', 0x30);
     Ok(unsafe {
-        let tiocgptn = Getter::<ReadOpcode<b'T', 0x30, u32>, u32>::new();
+        let tiocgptn = Getter::<TIOCGPTN, u32>::new();
         ioctl(fd, tiocgptn)?
     })
 }
 
-static mut OLD_STDIN: Option<Termios> = None;
+static OLD_STDIN: Mutex<Option<Termios>> = Mutex::new(None);
 
 fn watch_sigwinch_async(slave: RawFd) {
     let mut winch = MaybeUninit::<sigset_t>::uninit();
@@ -61,32 +67,25 @@ fn watch_sigwinch_async(slave: RawFd) {
     });
 }
 
-fn set_stdin_raw() {
-    let mut termios = match tcgetattr(stdin()) {
-        Result::Ok(termios) => {
-            unsafe {
-                OLD_STDIN = Some(termios.clone());
-            }
-            termios
-        }
-        Err(_) => return,
-    };
+fn set_stdin_raw() -> rustix::io::Result<()> {
+    let mut termios = tcgetattr(stdin())?;
+
+    let mut guard = OLD_STDIN.lock().unwrap();
+    *guard = Some(termios.clone());
+    drop(guard);
 
     termios.make_raw();
-
-    if tcsetattr(stdin(), OptionalActions::Flush, &termios).is_err() {
-        let _ = tcsetattr(stdin(), OptionalActions::Drain, &termios);
-    }
+    tcsetattr(stdin(), OptionalActions::Flush, &termios)
 }
 
-fn restore_stdin() {
-    let Some(termios) = (unsafe { OLD_STDIN.take() }) else {
-        return;
-    };
+fn restore_stdin() -> Result<()> {
+    let mut guard = OLD_STDIN.lock().unwrap();
 
-    if tcsetattr(stdin(), OptionalActions::Flush, &termios).is_err() {
-        let _ = tcsetattr(stdin(), OptionalActions::Drain, &termios);
+    if let Some(original_termios) = guard.take() {
+        tcsetattr(stdin(), OptionalActions::Flush, &original_termios)?;
     }
+
+    Ok(())
 }
 
 fn pump<R: Read, W: Write>(mut from: R, mut to: W) {
@@ -112,7 +111,7 @@ fn pump<R: Read, W: Write>(mut from: R, mut to: W) {
 }
 
 fn pump_stdin_async(mut ptmx: File) {
-    set_stdin_raw();
+    let _ = set_stdin_raw();
 
     thread::spawn(move || {
         let mut stdin = stdin();
@@ -124,7 +123,7 @@ fn pump_stdout_blocking(mut ptmx: File) {
     let mut stdout = stdout();
     pump(&mut ptmx, &mut stdout);
 
-    restore_stdin();
+    let _ = restore_stdin();
 }
 
 fn create_transfer(ptmx: OwnedFd) -> Result<()> {
@@ -136,7 +135,7 @@ fn create_transfer(ptmx: OwnedFd) -> Result<()> {
     }
 
     let ptmx_r = ptmx;
-    let ptmx_w = dup(&ptmx_r).unwrap();
+    let ptmx_w = dup(&ptmx_r)?;
 
     let ptmx_r = File::from(ptmx_r);
     let ptmx_w = File::from(ptmx_w);
@@ -145,18 +144,30 @@ fn create_transfer(ptmx: OwnedFd) -> Result<()> {
     pump_stdin_async(ptmx_r);
     pump_stdout_blocking(ptmx_w);
 
-    let mut status: c_int = -1;
+    let mut status: c_int = 0;
 
-    unsafe {
+    let code = unsafe {
         loop {
-            if waitpid(pid, &mut status, 0) == -1 && *__errno() != EINTR {
-                continue;
+            if waitpid(pid, &mut status, 0) != -1 {
+                break;
             }
-            break;
+            if *__errno() != EINTR {
+                // Permanent waitpid failure (e.g. ECHILD): the child is gone and
+                // its real exit status is unknowable.
+                exit(1);
+            }
         }
-    }
+        if libc::WIFEXITED(status) {
+            libc::WEXITSTATUS(status)
+        } else if libc::WIFSIGNALED(status) {
+            // Shell convention for a child killed by a signal.
+            128 + libc::WTERMSIG(status)
+        } else {
+            1
+        }
+    };
 
-    exit(status)
+    exit(code)
 }
 
 pub fn prepare_pty() -> Result<()> {
